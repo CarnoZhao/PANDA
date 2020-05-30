@@ -1,0 +1,7 @@
+_archives
+_data
+_models
+_outs
+_plots
+nohup.out
+__pycache__/*
