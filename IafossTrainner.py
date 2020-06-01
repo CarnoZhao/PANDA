@@ -26,7 +26,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("-f", "--h5", help = "h5 file path", default = "/home/zhaoxun/codes/Panda/_data/v0.h5", type = str)
     parser.add_argument("-M", "--MD", help = "model file", default = "", type = str)
-    parser.add_argument("-N", "--nt", help = "net type", default = "resnet34", choices = ["resnet34", "resnext50", "eff"], type = str)
+    parser.add_argument("-N", "--nt", help = "net type", default = "resnet34", choices = ["resnet34", "resnext50", "eff", "resnext50list"], type = str)
     parser.add_argument("-e", "--ep", help = "number of epochs", default = 5, type = int)
     parser.add_argument("-n", "--nc", help = "number of classes", default = 6, type = int)
     # parser.add_argument("-p", "--pt", help = "pretrained", default = True, type = bool)
@@ -41,7 +41,6 @@ def parse_args():
     parser.add_argument("-s", "--sm", help = "label smoothing", default = 0.001, type = float)
     parser.add_argument("-m", "--gm", help = "focal loss gamma", default = 2, type = int)
     parser.add_argument("-o", "--op", help = "optim method", default = "sgd", choices = ["sgd", "adam", "over"], type = str)
-    parser.add_argument("-v", "--df", help = "divide factor", default = 100, type = int)
     # parser.add_argument("-S", "--sc", help = "learning rate scheduler", default = "cos", type = str)
     return vars(parser.parse_args())
 
@@ -71,59 +70,118 @@ import PoolTileNet
 from fastai import *
 from fastai.vision import *
 from fastai.callbacks import *
+from sklearn.model_selection import StratifiedKFold
 from radam import *
 from Radam import *
 # torch.backends.cudnn.benchmark = True
 setup_seed(1)
+TRAIN = "/home/zhaoxun/codes/Panda/_data/iafoss/train"
+LABELS = '/home/zhaoxun/codes/Panda/_data/train.csv'
+nfolds = 5
+SEED = 0
+mean = torch.tensor([1.0-0.90949707, 1.0-0.8188697, 1.0-0.87795304])
+std = torch.tensor([0.36357649, 0.49984502, 0.40477625])
+df = pd.read_csv(LABELS).set_index('image_id')
+sz = 128
+bs = 32
+N = 12
 
-class Data(object):
-    def __init__(self, h5, ratio = 0.8):
-        h = h5py.File(h5, 'r')
-        self.img = h['img']
-        self.msk = h['msk']
-        self.lbl = h['lbl']
-        self.meanstd = h['meanstd']
-        length = self.lbl.shape[0]
-        lennames = len(set(self.lbl[:,0]))
-        self.trainidx = np.arange(round(ratio * lennames))
-        self.validx = np.arange(round(ratio * lennames), lennames)
+files = sorted(set([p[:32] for p in os.listdir(TRAIN)]))
+df = df.loc[files]
+df = df.reset_index()
+splits = StratifiedKFold(n_splits=nfolds, random_state=SEED, shuffle=True)
+splits = list(splits.split(df,df.isup_grade))
+folds_splits = np.zeros(len(df)).astype(np.int)
+for i in range(nfolds): 
+    folds_splits[splits[i][1]] = i
+df['split'] = folds_splits
+    # df.head()
 
-    def toLoader(self, batch_size):
-        trainDataset = self.Dataset(self.img, self.msk, self.lbl, self.meanstd, self.trainidx)
-        valDataset = self.Dataset(self.img, self.msk, self.lbl, self.meanstd, self.validx)
-        trainLoader = torch.utils.data.DataLoader(trainDataset, batch_size = batch_size, shuffle = True, num_workers = 4, drop_last = True)
-        valLoader = torch.utils.data.DataLoader(valDataset, batch_size = 1, shuffle = False, num_workers = 4)
-        return ImageDataBunch(trainLoader, valLoader, device = "cuda")
-        # return trainLoader, valLoader
+def open_image(fn:PathOrStr, div:bool=True, convert_mode:str='RGB', cls:type=Image,
+    after_open:Callable=None)->Image:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning) # EXIF warning from TiffPlugin
+        x = PIL.Image.open(fn).convert(convert_mode)
+    if after_open: x = after_open(x)
+    x = pil2tensor(x,np.float32)
+    if div: x.div_(255)
+    return cls(1.0-x) #invert image for zero padding
 
-    # torchvision.transforms.RandomHorizontalFlip(p=0.5)
-    # torchvision.transforms.ColorJitter(brightness=0, contrast=0, saturation=0, hue=0)
+class MImage(ItemBase):
+    def __init__(self, imgs):
+        self.obj, self.data = \
+        (imgs), [(imgs[i].data - mean[...,None,None])/std[...,None,None] for i in range(len(imgs))]
+    
+    def apply_tfms(self, tfms,*args, **kwargs):
+        for i in range(len(self.obj)):
+            self.obj[i] = self.obj[i].apply_tfms(tfms, *args, **kwargs)
+            self.data[i] = (self.obj[i].data - mean[...,None,None])/std[...,None,None]
+        return self
+    
+    def __repr__(self): return f'{self.__class__.__name__} {img.shape for img in self.obj}'
 
-    class Dataset(torch.utils.data.Dataset):
-        def __init__(self, img, msk, lbl, meanstd, idx):
-            self.img = img
-            self.msk = msk
-            self.lbl = lbl[:,3].astype(np.int)
-            self.mean = meanstd[0][np.newaxis, :, np.newaxis, np.newaxis]
-            self.std = meanstd[1][np.newaxis, :, np.newaxis, np.newaxis]
-            self.idx = idx
+    def to_one(self):
+        img = torch.stack(self.data,1)
+        img = img.view(3,-1,N,sz,sz).permute(0,1,3,2,4).contiguous().view(3,-1,sz*N)
+        return Image(1.0 - (mean[...,None,None]+img*std[...,None,None]))
 
-        def __getitem__(self, i):
-            x = (self.img[self.idx[i] * 16:(self.idx[i] + 1) * 16] / 255.).astype(np.float32)
-            x = -(x - self.mean) / self.std
-            y = self.lbl[self.idx[i] * 16]
-            return x.astype(np.float32), y
+class MImageItemList(ImageList):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+    
+    def __len__(self)->int: return len(self.items) or 1 
+    
+    def get(self, i):
+        fn = Path(self.items[i])
+        fnames = [Path(str(fn)+'_'+str(i)+'.png')for i in range(N)]
+        imgs = [open_image(fname, convert_mode=self.convert_mode, after_open=self.after_open)
+            for fname in fnames]
+        return MImage(imgs)
 
-        def __len__(self):
-            return len(self.idx)
+    def reconstruct(self, t):
+        return MImage([mean[...,None,None]+_t*std[...,None,None] for _t in t])
+    
+    def show_xys(self, xs, ys, figsize:Tuple[int,int]=(300,50), **kwargs):
+        rows = min(len(xs),8)
+        fig, axs = plt.subplots(rows,1,figsize=figsize)
+        for i, ax in enumerate(axs.flatten() if rows > 1 else [axs]):
+            xs[i].to_one().show(ax=ax, y=ys[i], **kwargs)
+        plt.tight_layout()
+        
+
+#collate function to combine multiple images into one tensor
+def MImage_collate(batch:ItemsList)->Tensor:
+    result = torch.utils.data.dataloader.default_collate(to_data(batch))
+    if isinstance(result[0],list):
+        result = [torch.stack(result[0],1),result[1]]
+    return result
+
+def get_data(fold=0):
+    return (MImageItemList.from_df(df, path='/', folder=TRAIN, cols='image_id')
+    .split_by_idx(df.index[df.split == fold].tolist())
+    .label_from_df(cols=['isup_grade'])
+    .transform(get_transforms(flip_vert=True,max_rotate=15),size=sz,padding_mode='zeros')
+    .databunch(bs=bs,num_workers=4))
 
 class Train(object):
     def __init__(self, **kwargs):
         self.kwargs = kwargs
-        self.data = Data(kwargs['h5'])
+        # self.data = Data(kwargs['h5'])
 
         # model
-        self.load_net()
+        if kwargs['nt'] == "resnet34":
+            self.net = PoolTileNet.PoolTileNet(kwargs["nc"])
+        elif kwargs['nt'] == "resnext50":
+            self.net = PoolTileNet.SemiResNext(n = kwargs['nc'])
+        elif kwargs['nt'] == "resnext50list":
+            self.net = PoolTileNet.SemiResNextList(n = kwargs['nc'])
+        elif kwargs['nt'] == "eff":
+            self.net = PoolTileNet.MyEfficientNet(kwargs['nc'])
+
+        self.net = self.net.cuda()
+        if kwargs['MD']:
+            dic = torch.load(kwargs['MD'])
+            self.net.load_state_dict(dic)
 
         # loss
         if kwargs['ls'] == "focal":
@@ -131,46 +189,13 @@ class Train(object):
         elif kwargs['ls'] == "cross":
             self.loss = torch.nn.CrossEntropyLoss()
         
-        # opts
-        # convlinearparams = []
-        # for m in self.net.modules():
-        #     if type(m) is torch.nn.Conv2d or type(m) is torch.nn.Linear:
-        #         convlinearparams.extend(m.parameters())
-        # otherparams = [p for p in self.net.parameters() if id(p) not in [id(pp) for pp in convlinearparams]]
-        # if kwargs['op'] == "sgd":
-        #     self.opt = torch.optim.SGD([
-        #         {"params": convlinearparams, "weight_decay": kwargs['wd']},
-        #         {"params": otherparams}
-        #     ], lr = kwargs['lr'], momentum = 0.9, nesterov = True)
-        # elif kwargs['op'] == "adam":
-        #     self.opt = torch.optim.Adam([
-        #         {"params": convlinearparams, "weight_decay": kwargs['wd']},
-        #         {"params": otherparams}
-        #     ], lr = kwargs['lr'])
         if kwargs['op'] == "sgd":
             self.opt = torch.optim.SGD
         elif kwargs['op'] == "adam":
             self.opt = RAdam
         elif kwargs['op'] == "over":
             self.opt = Over9000
-        
-        # scheduler
-        # if kwargs['sc'] == "plat":
-        #     self.sch = torch.optim.lr_scheduler.ReduceLROnPlateau(self.opt, "min", patience = 2)
-        # elif kwargs['sc'] == "cos":
-        #     self.sch = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, kwargs['ep'])
-
-    def load_net(self):
-        if self.kwargs['nt'] == "resnet34":
-            self.net = PoolTileNet.PoolTileNet(self.kwargs["nc"])
-        elif self.kwargs['nt'] == "resnext50":
-            self.net = PoolTileNet.SemiResNext(n = self.kwargs['nc'])
-        elif self.kwargs['nt'] == "eff":
-            self.net = PoolTileNet.MyEfficientNet(self.kwargs['nc'])
-        self.net = self.net.cuda()
-        if self.kwargs['MD']:
-            dic = torch.load(self.kwargs['MD'])
-            self.net.load_state_dict(dic)
+    
 
     def callback_bak(self, i, loss, valloader):
         self.losses["train"].append(loss)
@@ -241,28 +266,6 @@ class Train(object):
         printOut("Val kappa: %.5f" % cohen_kappa_score(t, p, weights = 'quadratic'))
         printOut(confusion_matrix(t, p))
 
-    def bag_eval(self):
-        pred,target = [],[]
-        dirpath = modelpath + "s"
-        dl = self.data.toLoader(self.kwargs['bs'])
-        for bag in range(self.kwargs['bg']):
-            self.net.load_state_dict(torch.load(os.path.join(dirpath, "model.%d.pth" % bag)))
-            ln = Learner(dl, self.net, loss_func = self.loss, opt_func = self.opt, metrics = [KappaScore(weights = 'quadratic')], bn_wd = False, wd = self.kwargs['wd']).to_fp16()
-            ln.model.eval()
-            with torch.no_grad():
-                for step, (x, y) in progress_bar(enumerate(ln.data.dl(DatasetType.Valid)), total=len(ln.data.dl(DatasetType.Valid))):
-                    p = ln.model(x)
-                    if len(pred) == step: 
-                        pred.append(p.float().cpu())
-                        target.append(y.cpu())
-                    else:
-                        pred[step] += p.float().cpu()
-                        target[step] += p.cpu()
-        p = torch.argmax(torch.cat(pred, 0), 1)
-        t = torch.cat(target)
-        printOut("Val kappa: %.5f" % cohen_kappa_score(t, p, weights = 'quadratic'))
-        printOut(confusion_matrix(t, p))
-
     def train_bak(self):
         trainloader, valloader = self.data.toLoader(self.kwargs['bs'])
         for i in tqdm.tqdm(range(1, self.kwargs['ep'] + 1), desc = "Iterating...", mininterval = 60):
@@ -282,25 +285,15 @@ class Train(object):
         self.evaluations(trainloader, valloader)
 
     def train(self):
-        dl = self.data.toLoader(self.kwargs['bs'])
+        dl = get_data()
         ln = Learner(dl, self.net, loss_func = self.loss, opt_func = self.opt, metrics = [KappaScore(weights = 'quadratic')], bn_wd = False, wd = self.kwargs['wd']).to_fp16()
         ln.clip_grad = 1.0
         ln.split([self.net.head])
         ln.unfreeze()
         cb = self.callback(ln)
-        ln.fit_one_cycle(self.kwargs['ep'], max_lr = self.kwargs['lr'], div_factor = self.kwargs['df'], pct_start = 0.0, wd = self.kwargs['wd'], callbacks = [cb])
+        ln.fit_one_cycle(self.kwargs['ep'], max_lr = self.kwargs['lr'], div_factor = 100, pct_start = 0.0, wd = self.kwargs['wd'], callbacks = [cb])
         torch.save(self.net.state_dict(), modelpath)
         self.evaluations(ln)
-
-    def bag_train(self):
-        dirpath = modelpath + "s"
-        os.mkdir(dirpath)
-        for bag in range(self.kwargs['bg']):
-            self.load_net()
-            self.train()
-            os.system("mv %s %s" % (modelpath, os.path.join(dirpath, "model.%d.pth" % bag)))
-        self.bag_eval()
-
 
 if __name__ == "__main__":
     for k, v in params.items():

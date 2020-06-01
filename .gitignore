@@ -5,3 +5,4 @@ _outs
 _plots
 nohup.out
 __pycache__/*
+*checkpoint*
