@@ -35,7 +35,8 @@ def parse_args():
     parser.add_argument("-c", "--cb", help = "call-back step size", default = 1, type = int)
     # parser.add_argument("-s", "--ss", help = "learning rate scheduler step size", default = 30, type = int)
     parser.add_argument("-w", "--wd", help = "weight decay", default = 1e-3, type = float)
-    parser.add_argument("-W", "--wt", help = "weight of loss", default = [1, 1, 5], type = list)
+    # parser.add_argument("-W", "--wt", help = "weight of loss", default = [1, 1, 5], type = list)
+    parser.add_argument("-W", "--wt", help = "weight of loss", default = [1, 1, 5], nargs = '+', type = int)
     parser.add_argument("-g", "--gp", help = "gpus", default = [0], type = list)
     parser.add_argument("-d", "--dv", help = "visible devices", default = "0", type = str)
     parser.add_argument("-s", "--sm", help = "label smoothing", default = 0.001, type = float)
@@ -88,7 +89,7 @@ class Data(object):
         def __getitem__(self, i):
             x = self.img[self.idx[i]] / 255.
             x = (x - self.mean) / self.std
-            y = self.msk[self.idx[i]]
+            y = self.msk[self.idx[i]].astype(np.int)
             return x.astype(np.float32), y
 
         def __len__(self):

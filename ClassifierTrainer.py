@@ -2,15 +2,13 @@ import os
 import tqdm
 import time
 import h5py
-import torch
 import random
 import argparse
 import traceback
-import torchvision
-import PoolTileNet
 import warnings
 import numpy as np
 import matplotlib.pyplot as plt
+from sklearn import metrics
 
 root = "/home/zhaoxun/codes/Panda"
 warnings.filterwarnings("ignore", category = UserWarning)
@@ -22,23 +20,28 @@ def setup_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
+    # set_all_seed(seed)
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("-f", "--h5", help = "h5 file path", default = "/home/zhaoxun/codes/Panda/_data/v0.h5", type = str)
     parser.add_argument("-M", "--MD", help = "model file", default = "", type = str)
+    parser.add_argument("-N", "--nt", help = "net type", default = "resnet34", type = str)
     parser.add_argument("-e", "--ep", help = "number of epochs", default = 5, type = int)
     parser.add_argument("-n", "--nc", help = "number of classes", default = 6, type = int)
     # parser.add_argument("-p", "--pt", help = "pretrained", default = True, type = bool)
     parser.add_argument("-l", "--lr", help = "learning rate", default = 1e-3, type = float)
+    parser.add_argument("-L", "--ls", help = "loss type", default = "cross", type = str)
     parser.add_argument("-b", "--bs", help = "batch size", default = 32, type = int)
     parser.add_argument("-c", "--cb", help = "call-back step size", default = 1, type = int)
     # parser.add_argument("-s", "--ss", help = "learning rate scheduler step size", default = 30, type = int)
     parser.add_argument("-w", "--wd", help = "weight decay", default = 1e-3, type = float)
     parser.add_argument("-g", "--gp", help = "gpus", default = [0], type = list)
-    parser.add_argument("-d", "--dv", help = "visible devices", default = "0", type = str)
+    parser.add_argument("-d", "--dv", help = "visible devices", default = "3", type = str)
     parser.add_argument("-s", "--sm", help = "label smoothing", default = 0.001, type = float)
     parser.add_argument("-m", "--gm", help = "focal loss gamma", default = 2, type = int)
+    parser.add_argument("-o", "--op", help = "optim method", default = "sgd", type = str)
+    parser.add_argument("-S", "--sc", help = "learning rate scheduler", default = "cos", type = str)
     return vars(parser.parse_args())
 
 def make_file_path():
@@ -57,6 +60,17 @@ def printOut(*args):
         f.write(' '.join([str(arg) for arg in args]))
         f.write('\n')
 
+modelpath, plotpath, outpath, starttime, basepath = make_file_path()
+params = parse_args()
+printOut("using GPU: " + params['dv'])
+os.environ["CUDA_VISIBLE_DEVICES"] = params.pop("dv")
+import torch
+import torchvision
+import PoolTileNet
+from fastai import *
+from fastai.vision import *
+setup_seed(1)
+
 class Data(object):
     def __init__(self, h5):
         h = h5py.File(h5, 'r')
@@ -72,15 +86,19 @@ class Data(object):
     def toLoader(self, batch_size):
         trainDataset = self.Dataset(self.img, self.msk, self.lbl, self.meanstd, self.trainidx)
         valDataset = self.Dataset(self.img, self.msk, self.lbl, self.meanstd, self.validx)
-        trainLoader = torch.utils.data.DataLoader(trainDataset, batch_size = batch_size, shuffle = True, num_workers = 4)
+        trainLoader = torch.utils.data.DataLoader(trainDataset, batch_size = batch_size, shuffle = True, num_workers = 4, drop_last = True)
         valLoader = torch.utils.data.DataLoader(valDataset, batch_size = 1, shuffle = False, num_workers = 4)
+        # return ImageDataBunch(trainLoader, valLoader)
         return trainLoader, valLoader
+
+    # torchvision.transforms.RandomHorizontalFlip(p=0.5)
+    # torchvision.transforms.ColorJitter(brightness=0, contrast=0, saturation=0, hue=0)
 
     class Dataset(torch.utils.data.Dataset):
         def __init__(self, img, msk, lbl, meanstd, idx):
             self.img = img
             self.msk = msk
-            self.lbl = lbl
+            self.lbl = lbl[:,3].astype(np.int)
             self.mean = meanstd[0][np.newaxis, :, np.newaxis, np.newaxis]
             self.std = meanstd[1][np.newaxis, :, np.newaxis, np.newaxis]
             self.idx = idx
@@ -88,7 +106,7 @@ class Data(object):
         def __getitem__(self, i):
             x = (self.img[self.idx[i] * 16:(self.idx[i] + 1) * 16] / 255.).astype(np.float32)
             x = (x - self.mean) / self.std
-            y = self.lbl[self.idx[i] * 16,3]
+            y = self.lbl[self.idx[i] * 16]
             return x.astype(np.float32), y
 
         def __len__(self):
@@ -98,14 +116,47 @@ class Train(object):
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.data = Data(kwargs['h5'])
-        self.net = PoolTileNet.PoolTileNet(kwargs["nc"])
+
+        # model
+        if kwargs['nt'] == "resnet34":
+            self.net = PoolTileNet.PoolTileNet(kwargs["nc"])
+        elif kwargs['nt'] == "resnext50":
+            self.net = PoolTileNet.SemiResNext(n = kwargs['nc'])
         self.net = self.net.cuda()
         if kwargs['MD']:
             dic = torch.load(kwargs['MD'])
             self.net.load_state_dict(dic)
-        self.loss = PoolTileNet.FocalSmoothLoss(kwargs['nc'], kwargs['sm'], kwargs['gm'])
-        self.opt = torch.optim.SGD(self.net.parameters(), lr = self.kwargs['lr'], momentum = 0.9, nesterov = True, weight_decay = kwargs['wd'])
-        self.sch = torch.optim.lr_scheduler.ReduceLROnPlateau(self.opt, "min", patience = 2)
+
+        # loss
+        if kwargs['ls'] == "focal":
+            self.loss = PoolTileNet.FocalSmoothLoss(kwargs['nc'], kwargs['sm'], kwargs['gm'])
+        elif kwargs['ls'] == "cross":
+            self.loss = torch.nn.CrossEntropyLoss()
+        
+        # opts
+        convlinearparams = []
+        for m in self.net.modules():
+            if type(m) is torch.nn.Conv2d or type(m) is torch.nn.Linear:
+                convlinearparams.extend(m.parameters())
+        otherparams = [p for p in self.net.parameters() if id(p) not in [id(pp) for pp in convlinearparams]]
+        if kwargs['op'] == "sgd":
+            self.opt = torch.optim.SGD([
+                {"params": convlinearparams, "weight_decay": kwargs['wd']},
+                {"params": otherparams}
+            ], lr = kwargs['lr'], momentum = 0.9, nesterov = True)
+        elif kwargs['op'] == "adam":
+            self.opt = torch.optim.Adam([
+                {"params": convlinearparams, "weight_decay": kwargs['wd']},
+                {"params": otherparams}
+            ], lr = kwargs['lr'])
+        
+        # scheduler
+        if kwargs['sc'] == "plat":
+            self.sch = torch.optim.lr_scheduler.ReduceLROnPlateau(self.opt, "min", patience = 2)
+        elif kwargs['sc'] == "cos":
+            self.sch = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, kwargs['ep'])
+
+
         self.losses = {"train": [], "val": []}
 
     def callback(self, i, loss, valloader):
@@ -127,23 +178,18 @@ class Train(object):
         with torch.no_grad():
             self.net.eval()
             for i, loader in enumerate((trainloader, valloader)):
-                metric = np.zeros((self.kwargs['nc'], self.kwargs['nc']))
+                Y = np.zeros(len(loader.dataset), dtype = np.int); Yhat = np.zeros(len(loader.dataset), dtype = np.int); idx = 0
                 for x, y in tqdm.tqdm(loader, desc = "Evaluating...", leave = False, mininterval = 60):
-                    x = x.cuda()
+                    x = x.cuda(); y = y.numpy()
                     yhat = self.net(x).argmax(1).cpu().data.numpy()
-                    for yi, yhati in zip(y, yhat):
-                        metric[yi][yhati] += 1
-                printOut(["Train", "Val"][i] + " kappa: %.4f" % (self.kappa(metric)))
+                    Y[idx:idx + len(y)] = y; Yhat[idx:idx + len(y)] = yhat; idx += len(y)
+                printOut(["Train", "Val"][i] + " kappa: %.4f" % (metrics.cohen_kappa_score(Y, Yhat, weights = "quadratic")))
+                printOut(["Train", "Val"][i] + ":\n" + str(metrics.confusion_matrix(Y, Yhat)))
+                printOut("\n~~~~~\n")
         plt.plot(self.losses['train'], label = "train")
         plt.plot(self.losses['val'], label = "val")
         plt.legend()
         plt.savefig(plotpath)
-
-    def kappa(self, metric):
-        weight = np.array([[((i - j) ** 2) / ((self.kwargs['nc'] - 1) ** 2) for j in range(self.kwargs['nc'])] for i in range(self.kwargs['nc'])])
-        E = np.ones_like(metric) * np.mean(metric)
-        kappa = 1 - np.sum(weight * metric) / np.sum(weight * E)
-        return kappa
 
     def train(self):
         trainloader, valloader = self.data.toLoader(self.kwargs['bs'])
@@ -164,11 +210,6 @@ class Train(object):
         self.evaluations(trainloader, valloader)
 
 if __name__ == "__main__":
-    setup_seed(1)
-    modelpath, plotpath, outpath, starttime, basepath = make_file_path()
-    params = parse_args()
-
-    os.environ["CUDA_VISIBLE_DEVICES"] = params.pop("dv")
     for k, v in params.items():
         printOut(k, ':', v)
     try:

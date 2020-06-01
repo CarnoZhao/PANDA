@@ -1,13 +1,20 @@
 import torch
 import torchvision
+import torch.nn as nn
+import torch.nn.functional as F
+import fastai
+from fastai.vision import *
+from efficientnet_pytorch import EfficientNet
 
 class PoolTileNet(torch.nn.Module):
     def __init__(self, nc):
         super(PoolTileNet, self).__init__()
-        net = torchvision.models.resnext50_32x4d(pretrained = True)
+        # net = torchvision.models.resnext50_32x4d(pretrained = True)
+        net = torchvision.models.resnet34(pretrained = True)
+        infeature = net.fc.in_features
         self.net1 = torch.nn.Sequential(*list(net.children())[:-2])
         self.avgpool = torch.nn.AdaptiveAvgPool2d(output_size = (1, 1))
-        self.lnr = torch.nn.Linear(2048, nc)
+        self.lnr = torch.nn.Linear(infeature, nc)
 
     def forward(self, x):
         shape = x.shape
@@ -19,6 +26,23 @@ class PoolTileNet(torch.nn.Module):
         x = self.avgpool(x)
         x = x.view(x.shape[:2])
         x = self.lnr(x)
+        return x
+
+class MyEfficientNet(torch.nn.Module):
+    def __init__(self, nc):
+        super(MyEfficientNet, self).__init__()
+        net = EfficientNet.from_pretrained('efficientnet-b0')
+        self.net1 = torch.nn.Sequential(*list(net.children())[:-5])
+        self.net2 = torch.nn.Sequential(*list(net.children())[-4:])
+
+    def forward(self, x):
+        shape = x.shape
+        n = shape[1]
+        x = x.view(-1,shape[2],shape[3],shape[4])
+        x = self.net1(x)
+        shape = x.shape
+        x = x.view(-1,n,shape[1],shape[2],shape[3]).permute(0,2,1,3,4).contiguous().view(-1,shape[1],shape[2]*n,shape[3])
+        x = self.net2(x)
         return x
     
 class FocalSmoothLoss(torch.nn.Module):
@@ -38,3 +62,52 @@ class FocalSmoothLoss(torch.nn.Module):
         logpt = pt.log()
         loss = -torch.pow(1 - pt, self.gm) * logpt
         return loss.mean()
+
+
+class MishFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return x * torch.tanh(F.softplus(x))   # x * tanh(ln(1 + exp(x)))
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x = ctx.saved_variables[0]
+        sigmoid = torch.sigmoid(x)
+        tanh_sp = torch.tanh(F.softplus(x)) 
+        return grad_output * (tanh_sp + x * sigmoid * (1 - tanh_sp * tanh_sp))
+
+class Mish(nn.Module):
+    def forward(self, x):
+        return MishFunction.apply(x)
+
+def to_Mish(model):
+    for child_name, child in model.named_children():
+        if isinstance(child, nn.ReLU):
+            setattr(model, child_name, Mish())
+        else:
+            to_Mish(child)
+
+class SemiResNext(nn.Module):
+    def __init__(self, arch='resnext50_32x4d_ssl', n=6, pre=True):
+        super().__init__()
+        m = torch.hub.load('facebookresearch/semi-supervised-ImageNet1K-models', arch)
+        self.enc = nn.Sequential(*list(m.children())[:-2])       
+        nc = list(m.children())[-1].in_features
+        self.head = nn.Sequential(AdaptiveConcatPool2d(), Flatten(),nn.Linear(2*nc,512),
+                            Mish(),nn.BatchNorm1d(512), nn.Dropout(0.5),nn.Linear(512,n))
+        
+    def forward(self, x):
+        shape = x.shape
+        n = shape[1]
+        x = x.view(-1,shape[2],shape[3],shape[4])
+        #x: bs*N x 3 x 128 x 128
+        x = self.enc(x)
+        #x: bs*N x C x 4 x 4
+        shape = x.shape
+        #concatenate the output for tiles into a single map
+        x = x.view(-1, n,shape[1],shape[2],shape[3]).permute(0,2,1,3,4).contiguous().view(-1,shape[1],shape[2]*n,shape[3])
+        #x: bs x C x N*4 x 4
+        x = self.head(x)
+        #x: bs x n
+        return x
