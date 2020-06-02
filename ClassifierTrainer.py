@@ -71,73 +71,18 @@ os.environ["CUDA_VISIBLE_DEVICES"] = params.pop("dv")
 import torch
 import torchvision
 import PoolTileNet
+import MyData
 from fastai import *
 from fastai.vision import *
 from fastai.callbacks import *
 from radam import *
 from Radam import *
-# torch.backends.cudnn.benchmark = True
 setup_seed(1)
-
-class Data(object):
-    def __init__(self, h5, ratio = 0.8):
-        h = h5py.File(h5, 'r')
-        self.img = h['img']
-        self.msk = h['msk']
-        self.lbl = h['lbl']
-        self.meanstd = h['meanstd']
-        length = self.lbl.shape[0]
-        lennames = len(set(self.lbl[:,0]))
-        self.trainidx = np.arange(round(ratio * lennames))
-        self.validx = np.arange(round(ratio * lennames), lennames)
-        self.trans = torchvision.transforms.Compose([
-            torchvision.transforms.RandomHorizontalFlip(),
-            torchvision.transforms.RandomHorizontalFlip(),
-            torchvision.transforms.RandomRotation(15)
-        ])
-
-    def toLoader(self, batch_size):
-        trainDataset = self.Dataset(self.img, self.msk, self.lbl, self.meanstd, self.trainidx, self.trans)
-        valDataset = self.Dataset(self.img, self.msk, self.lbl, self.meanstd, self.validx)
-        trainLoader = torch.utils.data.DataLoader(trainDataset, batch_size = batch_size, shuffle = True, num_workers = 4, drop_last = True)
-        valLoader = torch.utils.data.DataLoader(valDataset, batch_size = 1, shuffle = False, num_workers = 4)
-        return ImageDataBunch(trainLoader, valLoader, device = "cuda")
-
-    def toBagLoader(self, batch_size, bag_ratio = 0.8):
-        bagidx = np.random.choice(self.trainidx, round(bag_ratio * len(self.trainidx)))
-        trainDataset = self.Dataset(self.img, self.msk, self.lbl, self.meanstd, bagidx, self.trans)
-        valDataset = self.Dataset(self.img, self.msk, self.lbl, self.meanstd, self.validx)
-        trainLoader = torch.utils.data.DataLoader(trainDataset, batch_size = batch_size, shuffle = True, num_workers = 4, drop_last = True)
-        valLoader = torch.utils.data.DataLoader(valDataset, batch_size = 1, shuffle = False, num_workers = 4)
-        return ImageDataBunch(trainLoader, valLoader, device = "cuda")
-
-    class Dataset(torch.utils.data.Dataset):
-        def __init__(self, img, msk, lbl, meanstd, idx, trans = None):
-            self.img = img
-            self.msk = msk
-            self.lbl = lbl[:,3].astype(np.int)
-            self.mean = meanstd[0][np.newaxis, :, np.newaxis, np.newaxis]
-            self.std = meanstd[1][np.newaxis, :, np.newaxis, np.newaxis]
-            self.idx = idx
-            self.trans = trans
-
-        def __getitem__(self, i):
-            x = 255 - self.img[self.idx[i] * 16:(self.idx[i] + 1) * 16]
-            y = self.lbl[self.idx[i] * 16]
-            if self.trans:
-                for j in range(len(x)):
-                    tmp = PIL.Image.fromarray(x[j].transpose(1, 2, 0))
-                    x[j] = np.array(self.trans(tmp)).transpose(2, 0, 1)
-            x = (x / 255. - 1 + self.mean) / np.sqrt(self.std)
-            return x.astype(np.float32), y
-
-        def __len__(self):
-            return len(self.idx)
 
 class Train(object):
     def __init__(self, **kwargs):
         self.kwargs = kwargs
-        self.data = Data(kwargs['h5'])
+        self.data = MyData.PngData()
 
         # model
         self.load_net()
@@ -157,9 +102,9 @@ class Train(object):
 
     def load_net(self):
         if self.kwargs['nt'] == "resnet34":
-            self.net = PoolTileNet.PoolTileNet(self.kwargs["nc"])
+            self.net = PoolTileNet.PoolTileNetList(self.kwargs["nc"])
         elif self.kwargs['nt'] == "resnext50":
-            self.net = PoolTileNet.SemiResNext(n = self.kwargs['nc'])
+            self.net = PoolTileNet.SemiResNextList(n = self.kwargs['nc'])
         elif self.kwargs['nt'] == "eff":
             self.net = PoolTileNet.MyEfficientNet(self.kwargs['nc'])
         self.net = self.net.cuda()
@@ -228,7 +173,7 @@ class Train(object):
         ln.model.eval()
         with torch.no_grad():
             for step, (x, y) in progress_bar(enumerate(ln.data.dl(DatasetType.Valid)), total=len(ln.data.dl(DatasetType.Valid))):
-                p = ln.model(x)
+                p = ln.model(*x)
                 pred.append(p.float().cpu())
                 target.append(y.cpu())
         p = torch.argmax(torch.cat(pred, 0), 1)
@@ -239,14 +184,14 @@ class Train(object):
     def bag_eval(self):
         pred,target = [],[]
         dirpath = modelpath + "s"
-        dl = self.data.toBagLoader(self.kwargs['bs'], self.kwargs['br'])
+        dl = self.data.get_data(self.kwargs['bs'], 0, self.kwargs['br'])
         for bag in range(self.kwargs['bg']):
             self.net.load_state_dict(torch.load(os.path.join(dirpath, "model.%d.pth" % bag)))
             ln = Learner(dl, self.net, loss_func = self.loss, opt_func = self.opt, metrics = [KappaScore(weights = 'quadratic')], bn_wd = False, wd = self.kwargs['wd']).to_fp16()
             ln.model.eval()
             with torch.no_grad():
                 for step, (x, y) in progress_bar(enumerate(ln.data.dl(DatasetType.Valid)), total=len(ln.data.dl(DatasetType.Valid))):
-                    p = ln.model(x)
+                    p = ln.model(*x)
                     if len(pred) == step: 
                         pred.append(p.float().cpu())
                         target.append(y.cpu())
@@ -290,7 +235,7 @@ class Train(object):
         dirpath = modelpath + "s"
         os.system("mkdir -p %s" % dirpath)
         for bag in range(self.kwargs['bg']):
-            dl = self.data.toBagLoader(self.kwargs['bs'], self.kwargs['br'])
+            dl = self.data.get_data(self.kwargs['bs'], bag, self.kwargs['br'])
             self.load_net()
             self.train(dl)
             os.system("mv %s %s" % (modelpath, os.path.join(dirpath, "model.%d.pth" % bag)))

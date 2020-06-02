@@ -118,7 +118,7 @@ class MImage(ItemBase):
             self.data[i] = (self.obj[i].data - mean[...,None,None])/std[...,None,None]
         return self
     
-    def __repr__(self): return f'{self.__class__.__name__} {img.shape for img in self.obj}'
+    def __repr__(self): return f'{self.__class__.__name__} {[img.shape for img in self.obj]}'
 
     def to_one(self):
         img = torch.stack(self.data,1)
