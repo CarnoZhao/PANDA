@@ -6,6 +6,7 @@ import random
 import argparse
 import traceback
 import warnings
+import PIL.Image
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, cohen_kappa_score
@@ -42,6 +43,8 @@ def parse_args():
     parser.add_argument("-m", "--gm", help = "focal loss gamma", default = 2, type = int)
     parser.add_argument("-o", "--op", help = "optim method", default = "sgd", choices = ["sgd", "adam", "over"], type = str)
     parser.add_argument("-v", "--df", help = "divide factor", default = 100, type = int)
+    parser.add_argument("-B", "--bg", help = "bag iters", default = 0, type = int)
+    parser.add_argument("-R", "--br", help = "bag ratio", default = 0.8, type = float)
     # parser.add_argument("-S", "--sc", help = "learning rate scheduler", default = "cos", type = str)
     return vars(parser.parse_args())
 
@@ -87,31 +90,45 @@ class Data(object):
         lennames = len(set(self.lbl[:,0]))
         self.trainidx = np.arange(round(ratio * lennames))
         self.validx = np.arange(round(ratio * lennames), lennames)
+        self.trans = torchvision.transforms.Compose([
+            torchvision.transforms.RandomHorizontalFlip(),
+            torchvision.transforms.RandomHorizontalFlip(),
+            torchvision.transforms.RandomRotation(15)
+        ])
 
     def toLoader(self, batch_size):
-        trainDataset = self.Dataset(self.img, self.msk, self.lbl, self.meanstd, self.trainidx)
+        trainDataset = self.Dataset(self.img, self.msk, self.lbl, self.meanstd, self.trainidx, self.trans)
         valDataset = self.Dataset(self.img, self.msk, self.lbl, self.meanstd, self.validx)
         trainLoader = torch.utils.data.DataLoader(trainDataset, batch_size = batch_size, shuffle = True, num_workers = 4, drop_last = True)
         valLoader = torch.utils.data.DataLoader(valDataset, batch_size = 1, shuffle = False, num_workers = 4)
         return ImageDataBunch(trainLoader, valLoader, device = "cuda")
-        # return trainLoader, valLoader
 
-    # torchvision.transforms.RandomHorizontalFlip(p=0.5)
-    # torchvision.transforms.ColorJitter(brightness=0, contrast=0, saturation=0, hue=0)
+    def toBagLoader(self, batch_size, bag_ratio = 0.8):
+        bagidx = np.random.choice(self.trainidx, round(bag_ratio * len(self.trainidx)))
+        trainDataset = self.Dataset(self.img, self.msk, self.lbl, self.meanstd, bagidx, self.trans)
+        valDataset = self.Dataset(self.img, self.msk, self.lbl, self.meanstd, self.validx)
+        trainLoader = torch.utils.data.DataLoader(trainDataset, batch_size = batch_size, shuffle = True, num_workers = 4, drop_last = True)
+        valLoader = torch.utils.data.DataLoader(valDataset, batch_size = 1, shuffle = False, num_workers = 4)
+        return ImageDataBunch(trainLoader, valLoader, device = "cuda")
 
     class Dataset(torch.utils.data.Dataset):
-        def __init__(self, img, msk, lbl, meanstd, idx):
+        def __init__(self, img, msk, lbl, meanstd, idx, trans = None):
             self.img = img
             self.msk = msk
             self.lbl = lbl[:,3].astype(np.int)
             self.mean = meanstd[0][np.newaxis, :, np.newaxis, np.newaxis]
             self.std = meanstd[1][np.newaxis, :, np.newaxis, np.newaxis]
             self.idx = idx
+            self.trans = trans
 
         def __getitem__(self, i):
-            x = (self.img[self.idx[i] * 16:(self.idx[i] + 1) * 16] / 255.).astype(np.float32)
-            x = -(x - self.mean) / self.std
+            x = 255 - self.img[self.idx[i] * 16:(self.idx[i] + 1) * 16]
             y = self.lbl[self.idx[i] * 16]
+            if self.trans:
+                for j in range(len(x)):
+                    tmp = PIL.Image.fromarray(x[j].transpose(1, 2, 0))
+                    x[j] = np.array(self.trans(tmp)).transpose(2, 0, 1)
+            x = (x / 255. - 1 + self.mean) / np.sqrt(self.std)
             return x.astype(np.float32), y
 
         def __len__(self):
@@ -131,34 +148,12 @@ class Train(object):
         elif kwargs['ls'] == "cross":
             self.loss = torch.nn.CrossEntropyLoss()
         
-        # opts
-        # convlinearparams = []
-        # for m in self.net.modules():
-        #     if type(m) is torch.nn.Conv2d or type(m) is torch.nn.Linear:
-        #         convlinearparams.extend(m.parameters())
-        # otherparams = [p for p in self.net.parameters() if id(p) not in [id(pp) for pp in convlinearparams]]
-        # if kwargs['op'] == "sgd":
-        #     self.opt = torch.optim.SGD([
-        #         {"params": convlinearparams, "weight_decay": kwargs['wd']},
-        #         {"params": otherparams}
-        #     ], lr = kwargs['lr'], momentum = 0.9, nesterov = True)
-        # elif kwargs['op'] == "adam":
-        #     self.opt = torch.optim.Adam([
-        #         {"params": convlinearparams, "weight_decay": kwargs['wd']},
-        #         {"params": otherparams}
-        #     ], lr = kwargs['lr'])
         if kwargs['op'] == "sgd":
             self.opt = torch.optim.SGD
         elif kwargs['op'] == "adam":
             self.opt = RAdam
         elif kwargs['op'] == "over":
             self.opt = Over9000
-        
-        # scheduler
-        # if kwargs['sc'] == "plat":
-        #     self.sch = torch.optim.lr_scheduler.ReduceLROnPlateau(self.opt, "min", patience = 2)
-        # elif kwargs['sc'] == "cos":
-        #     self.sch = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, kwargs['ep'])
 
     def load_net(self):
         if self.kwargs['nt'] == "resnet34":
@@ -244,7 +239,7 @@ class Train(object):
     def bag_eval(self):
         pred,target = [],[]
         dirpath = modelpath + "s"
-        dl = self.data.toLoader(self.kwargs['bs'])
+        dl = self.data.toBagLoader(self.kwargs['bs'], self.kwargs['br'])
         for bag in range(self.kwargs['bg']):
             self.net.load_state_dict(torch.load(os.path.join(dirpath, "model.%d.pth" % bag)))
             ln = Learner(dl, self.net, loss_func = self.loss, opt_func = self.opt, metrics = [KappaScore(weights = 'quadratic')], bn_wd = False, wd = self.kwargs['wd']).to_fp16()
@@ -257,7 +252,6 @@ class Train(object):
                         target.append(y.cpu())
                     else:
                         pred[step] += p.float().cpu()
-                        target[step] += p.cpu()
         p = torch.argmax(torch.cat(pred, 0), 1)
         t = torch.cat(target)
         printOut("Val kappa: %.5f" % cohen_kappa_score(t, p, weights = 'quadratic'))
@@ -281,8 +275,8 @@ class Train(object):
         torch.save(self.net.state_dict(), modelpath)
         self.evaluations(trainloader, valloader)
 
-    def train(self):
-        dl = self.data.toLoader(self.kwargs['bs'])
+    def train(self, dl = None):
+        dl = self.data.toLoader(self.kwargs['bs']) if dl is None else dl
         ln = Learner(dl, self.net, loss_func = self.loss, opt_func = self.opt, metrics = [KappaScore(weights = 'quadratic')], bn_wd = False, wd = self.kwargs['wd']).to_fp16()
         ln.clip_grad = 1.0
         ln.split([self.net.head])
@@ -294,10 +288,11 @@ class Train(object):
 
     def bag_train(self):
         dirpath = modelpath + "s"
-        os.mkdir(dirpath)
+        os.system("mkdir -p %s" % dirpath)
         for bag in range(self.kwargs['bg']):
+            dl = self.data.toBagLoader(self.kwargs['bs'], self.kwargs['br'])
             self.load_net()
-            self.train()
+            self.train(dl)
             os.system("mv %s %s" % (modelpath, os.path.join(dirpath, "model.%d.pth" % bag)))
         self.bag_eval()
 
@@ -306,7 +301,7 @@ if __name__ == "__main__":
     for k, v in params.items():
         printOut(k, ':', v)
     try:
-        Train(**params).train()
+        Train(**params).train() if params['bg'] == 0 else Train(**params).bag_train()
         status = "S"
     except Exception as e:
         traceback.print_exc(file = open(outpath,'a'))
