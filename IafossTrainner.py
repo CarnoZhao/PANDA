@@ -26,7 +26,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("-f", "--h5", help = "h5 file path", default = "/home/zhaoxun/codes/Panda/_data/v0.h5", type = str)
     parser.add_argument("-M", "--MD", help = "model file", default = "", type = str)
-    parser.add_argument("-N", "--nt", help = "net type", default = "resnet34", choices = ["resnet34", "resnext50", "eff", "resnext50list"], type = str)
+    parser.add_argument("-N", "--nt", help = "net type", default = "resnet34", choices = ["resnet34", "resnext50", *["eff%d" % i for i in range(8)], "resnext50list"], type = str)
     parser.add_argument("-e", "--ep", help = "number of epochs", default = 5, type = int)
     parser.add_argument("-n", "--nc", help = "number of classes", default = 6, type = int)
     # parser.add_argument("-p", "--pt", help = "pretrained", default = True, type = bool)
@@ -62,7 +62,7 @@ def printOut(*args):
 
 modelpath, plotpath, outpath, starttime, basepath = make_file_path()
 params = parse_args()
-printOut("using GPU: " + params['dv'])
+printOut("Iafoss using GPU: " + params['dv'])
 os.environ["CUDA_VISIBLE_DEVICES"] = params.pop("dv")
 import torch
 import torchvision
@@ -78,7 +78,7 @@ setup_seed(1)
 TRAIN = "/home/zhaoxun/codes/Panda/_data/iafoss/train"
 LABELS = '/home/zhaoxun/codes/Panda/_data/train.csv'
 nfolds = 5
-SEED = 0
+SEED = 1
 mean = torch.tensor([1.0-0.90949707, 1.0-0.8188697, 1.0-0.87795304])
 std = torch.tensor([0.36357649, 0.49984502, 0.40477625])
 df = pd.read_csv(LABELS).set_index('image_id')
@@ -170,13 +170,11 @@ class Train(object):
 
         # model
         if kwargs['nt'] == "resnet34":
-            self.net = PoolTileNet.PoolTileNet(kwargs["nc"])
+            self.net = PoolTileNet.PoolTileNetList(kwargs["nc"])
         elif kwargs['nt'] == "resnext50":
-            self.net = PoolTileNet.SemiResNext(n = kwargs['nc'])
-        elif kwargs['nt'] == "resnext50list":
             self.net = PoolTileNet.SemiResNextList(n = kwargs['nc'])
-        elif kwargs['nt'] == "eff":
-            self.net = PoolTileNet.MyEfficientNet(kwargs['nc'])
+        elif kwargs['nt'].startswith("eff"):
+            self.net = PoolTileNet.MyEfficientNetList(kwargs['nc'], kwargs['nt'][-1])
 
         self.net = self.net.cuda()
         if kwargs['MD']:
@@ -196,20 +194,6 @@ class Train(object):
         elif kwargs['op'] == "over":
             self.opt = Over9000
     
-
-    def callback_bak(self, i, loss, valloader):
-        self.losses["train"].append(loss)
-        self.net.eval()
-        with torch.no_grad():
-            valloss = 0; valcnt = 0
-            for x, y in tqdm.tqdm(valloader, desc = "Validating...", leave = False, mininterval = 60):
-                x = x.cuda(); y = y.cuda()
-                yhat = self.net(x)
-                cost = self.loss(yhat, y.long())
-                valloss += cost.item() * len(x); valcnt += len(x)
-            self.losses["val"].append(valloss / valcnt)
-        printOut("{:3d} | tr: {:.3f} | vl: {:.3f}".format(i, loss, valloss / valcnt))
-        return valloss / valcnt
 
     class callback(LearnerCallback):
         def __init__(self, ln):
@@ -235,54 +219,25 @@ class Train(object):
             plt.legend()
             plt.savefig(plotpath)
 
-    def evaluations_bak(self, trainloader, valloader):
-        K = self.kwargs['nc']
-        with torch.no_grad():
-            self.net.eval()
-            for i, loader in enumerate((trainloader, valloader)):
-                Y = np.zeros(len(loader.dataset), dtype = np.int); Yhat = np.zeros(len(loader.dataset), dtype = np.int); idx = 0
-                for x, y in tqdm.tqdm(loader, desc = "Evaluating...", leave = False, mininterval = 60):
-                    x = x.cuda(); y = y.numpy()
-                    yhat = self.net(x).argmax(1).cpu().data.numpy()
-                    Y[idx:idx + len(y)] = y; Yhat[idx:idx + len(y)] = yhat; idx += len(y)
-                printOut(["Train", "Val"][i] + " kappa: %.4f" % (metrics.cohen_kappa_score(Y, Yhat, weights = "quadratic")))
-                printOut(["Train", "Val"][i] + ":\n" + str(metrics.confusion_matrix(Y, Yhat)))
-                printOut("\n~~~~~\n")
-        plt.plot(self.losses['train'], label = "train")
-        plt.plot(self.losses['val'], label = "val")
-        plt.legend()
-        plt.savefig(plotpath)
-
     def evaluations(self, ln):
         pred,target = [],[]
         ln.model.eval()
+        models = [ln.model]
         with torch.no_grad():
             for step, (x, y) in progress_bar(enumerate(ln.data.dl(DatasetType.Valid)), total=len(ln.data.dl(DatasetType.Valid))):
-                p = ln.model(x)
+                bs = len(x[0])
+                x = [torch.stack([x,x.flip(-1),x.flip(-2),x.flip(-1,-2),
+                    x.transpose(-1,-2),x.transpose(-1,-2).flip(-1),
+                    x.transpose(-1,-2).flip(-2),x.transpose(-1,-2).flip(-1,-2)],1).view(-1, *x.shape[1:]) for x in x]
+                p = [model(*x) for model in models]
+                p = torch.stack(p,1)
+                p = p.view(bs, 8 * len(models),-1).mean(1)
                 pred.append(p.float().cpu())
                 target.append(y.cpu())
         p = torch.argmax(torch.cat(pred, 0), 1)
         t = torch.cat(target)
         printOut("Val kappa: %.5f" % cohen_kappa_score(t, p, weights = 'quadratic'))
         printOut(confusion_matrix(t, p))
-
-    def train_bak(self):
-        trainloader, valloader = self.data.toLoader(self.kwargs['bs'])
-        for i in tqdm.tqdm(range(1, self.kwargs['ep'] + 1), desc = "Iterating...", mininterval = 60):
-            self.net.train()    
-            loss = 0; cnt = 0
-            for x, y in tqdm.tqdm(trainloader, desc = "Training...", leave = False, mininterval = 60):
-                x = x.cuda(); y = y.cuda()
-                yhat = self.net(x)
-                cost = self.loss(yhat, y.long())
-                loss += cost.item() * len(x); cnt += len(x)
-                self.opt.zero_grad()
-                cost.backward()
-                self.opt.step()
-            valloss = self.callback(i, loss / cnt, valloader)
-            self.sch.step(valloss)
-        torch.save(self.net.state_dict(), modelpath)
-        self.evaluations(trainloader, valloader)
 
     def train(self):
         dl = get_data()

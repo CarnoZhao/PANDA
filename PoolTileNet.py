@@ -126,8 +126,8 @@ class SemiResNextList(nn.Module):
         m = torch.hub.load('facebookresearch/semi-supervised-ImageNet1K-models', arch)
         self.enc = nn.Sequential(*list(m.children())[:-2])       
         nc = list(m.children())[-1].in_features
-        self.head = nn.Sequential(AdaptiveConcatPool2d(),Flatten(),nn.Linear(2*nc,512),
-                            Mish(),nn.BatchNorm1d(512), nn.Dropout(0.5),nn.Linear(512,n))
+        self.head = nn.Sequential(AdaptiveConcatPool2d(),Flatten(),nn.Linear(2*nc,512),Mish(),nn.BatchNorm1d(512), nn.Dropout(0.5),nn.Linear(512,n))
+        # self.head = nn.Sequential(AdaptiveConcatPool2d(),Flatten(),nn.Dropout(0.2),nn.Linear(2 * nc,n))
         
     def forward(self, *x):
         shape = x[0].shape
@@ -171,11 +171,12 @@ class PoolTileNetList(torch.nn.Module):
         return x
 
 class MyEfficientNetList(torch.nn.Module):
-    def __init__(self, nc):
+    def __init__(self, nc, which):
         super(MyEfficientNetList, self).__init__()
-        self.net = EfficientNet.from_pretrained('efficientnet-b0')
+        self.net = EfficientNet.from_pretrained('efficientnet-b' + which)
         infeature = self.net._conv_head.out_channels
         self.head = nn.Sequential(AdaptiveConcatPool2d(),Flatten(), nn.Linear(infeature * 2,512), Mish(),nn.BatchNorm1d(512), nn.Dropout(0.5),nn.Linear(512,nc),MemoryEfficientSwish())
+        # self.head = nn.Sequential(AdaptiveConcatPool2d(),Flatten(),nn.Dropout(0.2),nn.Linear(2 * infeature,nc))
 
     def net1(self, inputs):
         x = self.net._swish(self.net._bn0(self.net._conv_stem(inputs)))

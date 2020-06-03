@@ -139,9 +139,16 @@ class Train(object):
     def evaluations(self, ln):
         pred, target = [],[]
         ln.model.eval()
+        models = list(ln.model)
         with torch.no_grad():
             for step, (x, y) in progress_bar(enumerate(ln.data.dl(DatasetType.Valid)), total=len(ln.data.dl(DatasetType.Valid))):
-                p = ln.model(*x)
+                bs = len(x[0])
+                x = [torch.stack([x,x.flip(-1),x.flip(-2),x.flip(-1,-2),
+                    x.transpose(-1,-2),x.transpose(-1,-2).flip(-1),
+                    x.transpose(-1,-2).flip(-2),x.transpose(-1,-2).flip(-1,-2)],1).view(-1, *x.shape[1:]) for x in x]
+                p = [model(*x) for model in models]
+                p = torch.stack(p,1)
+                p = p.view(bs, 8 * len(models),-1).mean(1)
                 pred.append(p.float().cpu())
                 target.append(y.cpu())
         p = torch.argmax(torch.cat(pred, 0), 1)
@@ -173,12 +180,12 @@ class Train(object):
     def train(self, dl = None):
         dl = self.data.get_data(self.kwargs['bs']) if dl is None else dl
         # ln = Learner(dl, self.net, loss_func = self.loss, opt_func = self.opt, metrics = [KappaScore(weights = 'quadratic')], bn_wd = False, wd = self.kwargs['wd']).to_fp16()
-        ln = Learner(dl, self.net, loss_func = self.loss, opt_func = self.opt, metrics = [KappaScore(weights = 'quadratic')]).to_fp16()
+        ln = Learner(dl, self.net, loss_func = self.loss, opt_func = self.opt, metrics = [KappaScore(weights = 'quadratic')], bn_wd = False, wd = self.kwargs['wd']).to_fp16()
         ln.clip_grad = 1.0
         ln.split([self.net.head])
         ln.unfreeze()
         cb = self.callback(ln)
-        ln.fit_one_cycle(self.kwargs['ep'], max_lr = self.kwargs['lr'], div_factor = self.kwargs['df'], pct_start = 0.0, callbacks = [cb])
+        ln.fit_one_cycle(self.kwargs['ep'], max_lr = self.kwargs['lr'], div_factor = self.kwargs['df'], pct_start = 0.0, wd = self.kwargs['wd'], callbacks = [cb])
         torch.save(self.net.state_dict(), modelpath)
         self.evaluations(ln)
 
