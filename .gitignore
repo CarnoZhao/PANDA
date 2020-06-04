@@ -3,6 +3,8 @@ _data
 _models
 _outs
 _plots
+_summary
+*.pth
 nohup.out
 __pycache__/*
 *checkpoint*

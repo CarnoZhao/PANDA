@@ -101,17 +101,19 @@ class PngData(object):
                 plt.tight_layout()
         return _MyImageItemList
 
-    # collate function to combine multiple images into one tensor
     def MImage_collate(self, batch) -> Tensor:
         result = torch.utils.data.dataloader.default_collate(to_data(batch))
         if isinstance(result[0], list):
             result = [torch.stack(result[0], 1), result[1]]
         return result
 
-    def get_data(self, bs, bg = None, br = 0.8):
+    def get_data(self, bs, bg = None, br = 0.8, subsample = 1):
         trainidx = self.df.index[self.df.split != 0].tolist()
         if bg is not None: trainidx = np.random.choice(trainidx, round(len(trainidx) * br), replace = False)
         validx = self.df.index[self.df.split == 0].tolist()
+        if subsample != 1:
+            trainidx = np.random.choice(trainidx, round(len(trainidx) * subsample), replace = False)
+            validx = np.random.choice(validx, round(len(validx) * subsample), replace = False)
         return (self.MyImageItemList.from_df(self.df, path = '/', folder = self.TRAIN, cols = 'image_id')
                 .split_by_idxs(trainidx, validx)
                 .label_from_df(cols = ['isup_grade'])

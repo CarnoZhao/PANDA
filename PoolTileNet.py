@@ -175,7 +175,7 @@ class MyEfficientNetList(torch.nn.Module):
         super(MyEfficientNetList, self).__init__()
         self.net = EfficientNet.from_pretrained('efficientnet-b' + which)
         infeature = self.net._conv_head.out_channels
-        self.head = nn.Sequential(AdaptiveConcatPool2d(),Flatten(), nn.Linear(infeature * 2,512), Mish(),nn.BatchNorm1d(512), nn.Dropout(0.5),nn.Linear(512,nc),MemoryEfficientSwish())
+        self.head = nn.Sequential(AdaptiveConcatPool2d(),Flatten(), Mish(),nn.BatchNorm1d(infeature * 2), nn.Dropout(0.5),nn.Linear(infeature * 2,512), Mish(),nn.BatchNorm1d(512), nn.Dropout(0.5),nn.Linear(512,nc),MemoryEfficientSwish())
         # self.head = nn.Sequential(AdaptiveConcatPool2d(),Flatten(),nn.Dropout(0.2),nn.Linear(2 * infeature,nc))
 
     def net1(self, inputs):
