@@ -203,3 +203,37 @@ class MyEfficientNetList(torch.nn.Module):
         x = self.head(x)
         #x: bs x n
         return x
+
+class MyEfficientNetReg(torch.nn.Module):
+    def __init__(self, nc, which):
+        super(MyEfficientNetReg, self).__init__()
+        self.net = EfficientNet.from_pretrained('efficientnet-b' + which)
+        infeature = self.net._conv_head.out_channels
+        # self.head = nn.Sequential(AdaptiveConcatPool2d(),Flatten(), Mish(),nn.BatchNorm1d(infeature * 2), nn.Dropout(0.5),nn.Linear(infeature * 2,512), Mish(),nn.BatchNorm1d(512), nn.Dropout(0.5),nn.Linear(512,nc),MemoryEfficientSwish())
+        self.head = nn.Sequential(AdaptiveConcatPool2d(),Flatten(),nn.Dropout(0.2),nn.Linear(2 * infeature,1), nn.Sigmoid())
+
+    def net1(self, inputs):
+        x = self.net._swish(self.net._bn0(self.net._conv_stem(inputs)))
+        for idx, block in enumerate(self.net._blocks):
+            drop_connect_rate = self.net._global_params.drop_connect_rate
+            if drop_connect_rate:
+                drop_connect_rate *= float(idx) / len(self.net._blocks) # scale drop connect_rate
+            x = block(x, drop_connect_rate = drop_connect_rate)
+        x = self.net._swish(self.net._bn1(self.net._conv_head(x)))
+        return x
+
+    def forward(self, *x):
+        shape = x[0].shape
+        n = len(x)
+        x = torch.stack(x,1).view(-1,shape[1],shape[2],shape[3])
+        #x: bs*N x 3 x 128 x 128
+        x = self.net1(x)
+        #x: bs*N x C x 4 x 4
+        shape = x.shape
+        #concatenate the output for tiles into a single map
+        x = x.view(-1,n,shape[1],shape[2],shape[3]).permute(0,2,1,3,4).contiguous()\
+          .view(-1,shape[1],shape[2]*n,shape[3])
+        #x: bs x C x N*4 x 4
+        x = (self.head(x) * 6 - 0.5).squeeze(1)
+        #x: bs x n
+        return x

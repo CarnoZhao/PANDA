@@ -276,7 +276,7 @@ class Train(object):
             self.kwargs['ep'], 
             max_lr = self.kwargs['lr'],
             div_factor = 100, 
-            pct_start = 0.3, 
+            pct_start = 0.0, 
             # wd = [self.kwargs['wd'] / 10, self.kwargs['wd']], 
             wd = self.kwargs['wd'], 
             callbacks = [cb])
