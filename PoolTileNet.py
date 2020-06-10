@@ -6,6 +6,7 @@ import fastai
 from fastai.vision import *
 from efficientnet_pytorch import EfficientNet
 from efficientnet_pytorch.utils import *
+from fastai.layers import AdaptiveConcatPool2d, Flatten
 
 class PoolTileNet(torch.nn.Module):
     def __init__(self, nc):

@@ -1,7 +1,7 @@
 DEBUG = False
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = "2,3"
+os.environ['CUDA_VISIBLE_DEVICES'] = "0,1"
 import sys
 import time
 import skimage.io
@@ -114,13 +114,19 @@ class GeM(nn.Module):
 class enetv2(nn.Module):
     def __init__(self, backbone, out_dim):
         super(enetv2, self).__init__()
-        self.enet = enet.EfficientNet.from_name(backbone)
-        self.enet.load_state_dict(torch.load(pretrained_model[backbone]))
-        # self.enet = enet.EfficientNet.from_pretrained(backbone)
+        # net = torchvision.models.resnext50_32x4d(pretrained = True)
+        # infeature = net.fc.in_features
+        # self.enet = torch.nn.Sequential(*list(net.children())[:-2])
+        # self.myfc = nn.Sequential(GeM(), Flatten(), nn.Dropout(0.2), nn.Linear(infeature, out_dim))
 
+        self.enet = enet.EfficientNet.from_name(backbone)
+        state_dict = torch.load(pretrained_model[backbone])
+        self.enet.load_state_dict(state_dict)
         self.myfc = nn.Linear(self.enet._fc.in_features, out_dim)
+        # self.myfc2 = nn.Linear(self.enet._fc.in_features, out_dim + 1)
+        # self.enet._avg_pooling = GeM()
+        # self.enet._dropout = torch.nn.Dropout(0.4, inplace = False)
         self.enet._fc = nn.Identity()
-        # self.enet._avg_pooling = AdaptiveConcatPool2d()
 
     def extract(self, x):
         return self.enet(x)
@@ -129,6 +135,21 @@ class enetv2(nn.Module):
         x = self.extract(x)
         x = self.myfc(x)
         return x
+        # x1 = self.myfc(x)
+        # x2 = self.myfc2(x)
+        # return torch.cat([x1, x2], dim = 1)
+
+class MSECross(torch.nn.Module):
+    def __init__(self):
+        super(MSECross, self).__init__()
+        self.loss1 = torch.nn.BCEWithLogitsLoss()
+        self.loss2 = torch.nn.CrossEntropyLoss()
+
+    def forward(self, yhat, y):
+        loss1 = self.loss1(yhat[:,:5], y[:,:5])
+        loss2 = self.loss2(yhat[:,5:], y[:,5].long())
+        return loss1 + loss2
+        
 
 class PANDADataset(Dataset):
     def __init__(self, df, image_size, n_tiles = n_tiles, tile_mode = 0, rand = False, transform = None):
@@ -178,6 +199,9 @@ class PANDADataset(Dataset):
 
         label = np.zeros(5).astype(np.float32)
         label[:row.isup_grade] = 1.
+        # label = np.zeros(6).astype(np.float32)
+        # label[:row.isup_grade] = 1.
+        # label[5] = row.isup_grade
         return torch.tensor(images), torch.tensor(label)
 
 
@@ -188,8 +212,6 @@ transforms_train = albumentations.Compose([
     # albumentations.Rotate(15, border_mode = cv2.BORDER_CONSTANT, value = 255)
 ])
 transforms_val = albumentations.Compose([])
-
-criterion = nn.BCEWithLogitsLoss()
 
 def train_epoch(loader, optimizer):
     model.train()
@@ -225,6 +247,12 @@ def val_epoch(loader, get_output = False):
             data, target = data.to(device), target.to(device)
             logits = model(data)
             loss = criterion(logits, target)
+
+            ###
+            # logits = logits[:,:5]
+            # target = target[:,:5]
+            ###
+
             pred = logits.sigmoid().sum(1).detach().round()
             LOGITS.append(logits)
             PREDS.append(pred)
@@ -258,21 +286,24 @@ train_loader = torch.utils.data.DataLoader(dataset_train, batch_size = batch_siz
 valid_loader = torch.utils.data.DataLoader(dataset_valid, batch_size = batch_size, sampler = SequentialSampler(dataset_valid), num_workers = num_workers)
 
 model = enetv2(enet_type, out_dim=out_dim)
+# model.load_state_dict(torch.load("/home/zhaoxun/codes/Panda/_models/fold0.pth"))
 model = model.to(device)
 
-# optimizer = optim.Adam(model.parameters(), lr=init_lr/warmup_factor)
-# scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs-warmup_epo)
-# scheduler = GradualWarmupScheduler(optimizer, multiplier=warmup_factor, total_epoch=warmup_epo, after_scheduler=scheduler_cosine)
+criterion = nn.BCEWithLogitsLoss()
+# criterion = MSECross()
+optimizer = optim.Adam(model.parameters(), lr=init_lr/warmup_factor)
+scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs-warmup_epo)
+scheduler = GradualWarmupScheduler(optimizer, multiplier=warmup_factor, total_epoch=warmup_epo, after_scheduler=scheduler_cosine)
 
-optimizer = Radam.Over9000(model.parameters(), lr=init_lr)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs)
+# optimizer = Radam.Over9000(model.parameters(), lr = init_lr)
+# scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs)
 
-model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
+model, optimizer = amp.initialize(model, optimizer, opt_level = "O1")
 model = torch.nn.DataParallel(model, device_ids = [0, 1])
 
 
 qwk_max = 0.
-for epoch in range(1, n_epochs+1):
+for epoch in range(1, n_epochs + 1):
     printOut(time.ctime(), 'Epoch:', epoch)
     scheduler.step(epoch-1)
 
@@ -287,4 +318,4 @@ for epoch in range(1, n_epochs+1):
         torch.save(model.module.state_dict(), modelpath)
         qwk_max = qwk
 
-torch.save(model.state_dict(), os.path.join(modelpath.replace(".model", ".final.model")))
+torch.save(model.module.state_dict(), os.path.join(modelpath.replace(".model", ".final.model")))
