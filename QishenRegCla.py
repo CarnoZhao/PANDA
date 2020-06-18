@@ -1,23 +1,7 @@
 DEBUG = False
-gpus = "0,1"
-enet_type = 'efficientnet-b0'
-fold = 0
-tile_size = 256
-image_size = 256
-n_tiles = 36
-batch_size = 16
-num_workers = 4
-out_dim = 5
-init_lr = 6e-4
-warmup_factor = 10
-warmup_epo = 2
-seed = 0
-n_epochs = 1 if DEBUG else 30 + warmup_epo
-weight = 1.2
-isgem = True
-alpha = 0.4
 
 import os
+gpus = "2,3"
 os.environ['CUDA_VISIBLE_DEVICES'] = gpus
 import sys
 import time
@@ -42,7 +26,7 @@ from efficientnet_pytorch.utils import MemoryEfficientSwish
 import albumentations
 from sklearn.model_selection import StratifiedKFold
 import matplotlib.pyplot as plt
-from sklearn.metrics import cohen_kappa_score, confusion_matrix
+from sklearn.metrics import cohen_kappa_score
 # from tqdm import tqdm_notebook as tqdm
 from tqdm import tqdm
 from apex import amp
@@ -69,6 +53,21 @@ def printOut(*args):
 data_dir = '/home/zhaoxun/codes/Panda/_data'
 df_train = pd.read_csv(os.path.join(data_dir, 'train.csv'))
 image_folder = os.path.join(data_dir, 'qishen')
+# image_folder = os.path.join(data_dir, 'iafoss/train')
+
+printOut("Note: 1e-3 lr, 16 bs, 30 ep, GeM Pool, no big image aug")
+enet_type = 'efficientnet-b0'
+fold = 0
+tile_size = 256
+image_size = 256
+n_tiles = 36
+batch_size = 16
+num_workers = 4
+out_dim = 5
+init_lr = 1e-3
+warmup_factor = 10
+warmup_epo = 1
+seed = 0
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -78,7 +77,12 @@ def setup_seed(seed):
     torch.backends.cudnn.deterministic = True
 setup_seed(seed)
 
+n_epochs = 1 if DEBUG else 30
 df_train = df_train.sample(100).reset_index(drop=True) if DEBUG else df_train
+# df_train = df_train.set_index('image_id')
+# files = sorted(set([p[:32] for p in os.listdir(image_folder)]))
+# df_train = df_train.loc[files]
+# df_train = df_train.reset_index()
 
 device = torch.device('cuda')
 
@@ -94,14 +98,7 @@ pretrained_model = {
 }
 
 def gem(x, p=3, eps=1e-6):
-    return torch.nn.functional.avg_pool2d(x.clamp(min = eps).pow(p), (x.size(-2), x.size(-1))).pow(1./p)
-
-class MyBCELoss(torch.nn.Module):
-    def __init__(self):
-        super(MyBCELoss, self).__init__()
-
-    def forward(self, input, target, weight):
-        return F.binary_cross_entropy_with_logits(input, target, weight.unsqueeze(1), pos_weight = None, reduction = 'mean')
+    return torch.nn.functional.avg_pool2d(x.clamp(min=eps).pow(p), (x.size(-2), x.size(-1))).pow(1./p)
 
 class GeM(nn.Module):
     def __init__(self, p=3, eps=1e-6):
@@ -118,11 +115,17 @@ class GeM(nn.Module):
 class enetv2(nn.Module):
     def __init__(self, backbone, out_dim):
         super(enetv2, self).__init__()
+        # net = torchvision.models.resnext50_32x4d(pretrained = True)
+        # infeature = net.fc.in_features
+        # self.enet = torch.nn.Sequential(*list(net.children())[:-2])
+        # self.myfc = nn.Sequential(GeM(), Flatten(), nn.Dropout(0.2), nn.Linear(infeature, out_dim))
+
         self.enet = enet.EfficientNet.from_name(backbone)
         state_dict = torch.load(pretrained_model[backbone])
         self.enet.load_state_dict(state_dict)
-        self.myfc = nn.Linear(self.enet._fc.in_features * (1 if isgem else 2), out_dim)
-        self.enet._avg_pooling = GeM() if isgem else AdaptiveConcatPool2d() 
+        self.myfc = nn.Linear(self.enet._fc.in_features, out_dim)
+        self.myfc2 = nn.Linear(self.enet._fc.in_features, out_dim + 1)
+        # self.enet._avg_pooling = GeM()
         # self.enet._dropout = torch.nn.Dropout(0.4, inplace = False)
         self.enet._fc = nn.Identity()
 
@@ -131,9 +134,22 @@ class enetv2(nn.Module):
 
     def forward(self, x):
         x = self.extract(x)
-        x = self.myfc(x)
-        return x
+        x1 = self.myfc(x)
+        x2 = self.myfc2(x)
+        return torch.cat([x1, x2], dim = 1)
+
+class MSECross(torch.nn.Module):
+    def __init__(self):
+        super(MSECross, self).__init__()
+        self.loss1 = torch.nn.BCEWithLogitsLoss()
+        self.loss2 = torch.nn.CrossEntropyLoss()
+
+    def forward(self, yhat, y):
+        loss1 = self.loss1(yhat[:,:5], y[:,:5])
+        loss2 = self.loss2(yhat[:,5:], y[:,5].long())
+        return 2 * loss1 + loss2
         
+
 class PANDADataset(Dataset):
     def __init__(self, df, image_size, n_tiles = n_tiles, tile_mode = 0, rand = False, transform = None):
         self.df = df.reset_index(drop = True)
@@ -152,14 +168,13 @@ class PANDADataset(Dataset):
         
         tiles = [np.array(PIL.Image.open(os.path.join(image_folder, "%s_%d.png" % (img_id, idx)))) for idx in range(n_tiles)]
 
-        n_row_tiles = int(np.sqrt(self.n_tiles))
-        idxes = list(range(self.n_tiles))
         if self.rand:
-            idxes = np.random.choice(idxes, len(idxes), replace = False)
-            # for i in range(n_row_tiles):
-            #     idxes[i * n_row_tiles: (i + 1) * n_row_tiles] = np.random.choice(idxes[i * n_row_tiles: (i + 1) * n_row_tiles], n_row_tiles, replace = False)
+            idxes = np.random.choice(list(range(self.n_tiles)), self.n_tiles, replace = False)
+        else:
+            idxes = list(range(self.n_tiles))
 
-        images = np.zeros((image_size * n_row_tiles, image_size * n_row_tiles, 3), dtype = np.uint8)
+        n_row_tiles = int(np.sqrt(self.n_tiles))
+        images = np.zeros((image_size * n_row_tiles, image_size * n_row_tiles, 3))
         for h in range(n_row_tiles):
             for w in range(n_row_tiles):
                 i = h * n_row_tiles + w
@@ -175,66 +190,41 @@ class PANDADataset(Dataset):
                 w1 = w * image_size
                 images[h1:h1+image_size, w1:w1 + image_size] = this_img
 
-        if self.transform is not None:
-            images = self.transform(image = images)['image']
+        # if self.transform is not None:
+        #     images = self.transform(image = images)['image']
         images = images.astype(np.float32)
         images /= 255
         images = images.transpose(2, 0, 1)
 
-        label = np.zeros(5).astype(np.float32)
+        # label = np.zeros(5).astype(np.float32)
+        # label[:row.isup_grade] = 1.
+        label = np.zeros(6).astype(np.float32)
         label[:row.isup_grade] = 1.
-        return torch.tensor(images), torch.tensor(label), 1 if row.data_provider == "karolinska" else weight
+        label[5] = row.isup_grade
+        return torch.tensor(images), torch.tensor(label)
 
-def mixup_data(x, y, alpha=1, use_cuda=True):
-    '''Returns mixed inputs, pairs of targets, and lambda'''
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1
-
-    batch_size = x.size()[0]
-    index = torch.randperm(batch_size).to(device)
-
-    mixed_x = lam * x + (1 - lam) * x[index, :]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
-
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 transforms_train = albumentations.Compose([
     albumentations.Transpose(p = 0.5),
     albumentations.VerticalFlip(p = 0.5),
     albumentations.HorizontalFlip(p = 0.5),
-    albumentations.RandomBrightnessContrast(p = 0.5),
-    albumentations.Rotate(20, border_mode = cv2.BORDER_CONSTANT, value = 0)
+    # albumentations.Rotate(15, border_mode = cv2.BORDER_CONSTANT, value = 255)
 ])
 transforms_val = albumentations.Compose([])
 
-def train_epoch(loader, optimizer, mix = True):
+def train_epoch(loader, optimizer):
     model.train()
     train_loss = []
     # bar = tqdm(loader, mininterval = 60)
-    for (data, target, data_provider) in loader:
-        data, target, data_provider = data.to(device), target.to(device), data_provider.to(device)
+    for (data, target) in loader:
+        data, target = data.to(device), target.to(device)
+        loss_func = criterion
         optimizer.zero_grad()
-
-        # mixup
-        if mix == True:
-            mixdata, target_a, target_b, lam = mixup_data(data, target, alpha = alpha)
-            logits = model(mixdata)
-
-            # loss = loss_func(logits, target)
-            loss = mixup_criterion(criterion, logits, target_a, target_b, lam)
-        else:
-            optimizer.zero_grad()
-            logits = model(data)
-            loss = criterion(logits, target)
-        
+        logits = model(data)
+        loss = loss_func(logits, target)
         # loss.backward()
         with amp.scale_loss(loss, optimizer) as scaled_loss:
             scaled_loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         loss_np = loss.detach().cpu().numpy()
@@ -244,7 +234,7 @@ def train_epoch(loader, optimizer, mix = True):
     return train_loss
 
 
-def val_epoch(loader, tta = False):
+def val_epoch(loader, get_output = False):
     model.eval()
     val_loss = []
     LOGITS = []
@@ -252,19 +242,16 @@ def val_epoch(loader, tta = False):
     TARGETS = []
     acc = 0.
     with torch.no_grad():
-        for (data, target, data_provider) in loader:
-            data, target, data_provider = data.to(device), target.to(device), data_provider.to(device)
-            if tta:
-                logits = torch.stack([model(datai) for datai in [
-                        data,
-                        data.flip(-1), data.flip(-2), data.flip(-1, -2), 
-                        data.transpose(-1,-2), data.transpose(-1,-2).flip(-1), 
-                        data.transpose(-1,-2).flip(-2), data.transpose(-1,-2).flip(-1, -2)
-                    ]
-                ]).mean(0)
-            else:
-                logits = model(data)
+        for (data, target) in loader:
+            data, target = data.to(device), target.to(device)
+            logits = model(data)
             loss = criterion(logits, target)
+
+            ###
+            logits = logits[:,:5]
+            target = target[:,:5]
+            ###
+
             pred = logits.sigmoid().sum(1).detach().round()
             LOGITS.append(logits)
             PREDS.append(pred)
@@ -279,18 +266,11 @@ def val_epoch(loader, tta = False):
     qwk = cohen_kappa_score(PREDS, TARGETS, weights='quadratic')
     qwk_k = cohen_kappa_score(PREDS[df_valid['data_provider'] == 'karolinska'], df_valid[df_valid['data_provider'] == 'karolinska'].isup_grade.values, weights='quadratic')
     qwk_r = cohen_kappa_score(PREDS[df_valid['data_provider'] == 'radboud'], df_valid[df_valid['data_provider'] == 'radboud'].isup_grade.values, weights='quadratic')
-    printOut('qwk %.5f' % qwk, 'qwk_k %.5f' % qwk_k, 'qwk_r %.5f' % qwk_r)
-    if tta:
-        printOut(confusion_matrix(TARGETS, PREDS))
-        printOut(confusion_matrix(
-            df_valid[df_valid['data_provider'] == 'karolinska'].isup_grade.values,
-            PREDS[df_valid['data_provider'] == 'karolinska']
-        ))
-        printOut(confusion_matrix(
-            df_valid[df_valid['data_provider'] == 'radboud'].isup_grade.values,
-            PREDS[df_valid['data_provider'] == 'radboud']
-        ))
-    return val_loss, acc, qwk
+    printOut('qwk', qwk, 'qwk_k', qwk_k, 'qwk_r', qwk_r)
+    if get_output:
+        return LOGITS
+    else:
+        return val_loss, acc, qwk
 
 train_idx = np.where((df_train['fold'] != fold))[0]
 valid_idx = np.where((df_train['fold'] == fold))[0]
@@ -298,23 +278,24 @@ valid_idx = np.where((df_train['fold'] == fold))[0]
 df_this  = df_train.loc[train_idx]
 df_valid = df_train.loc[valid_idx]
 
-dataset_train = PANDADataset(df_this , image_size, n_tiles, rand = True, transform = transforms_train)
+dataset_train = PANDADataset(df_this , image_size, n_tiles, transform = transforms_train)
 dataset_valid = PANDADataset(df_valid, image_size, n_tiles, transform = transforms_val)
 
 train_loader = torch.utils.data.DataLoader(dataset_train, batch_size = batch_size, sampler = RandomSampler(dataset_train), num_workers = num_workers)
 valid_loader = torch.utils.data.DataLoader(dataset_valid, batch_size = batch_size, sampler = SequentialSampler(dataset_valid), num_workers = num_workers)
 
-model = enetv2(enet_type, out_dim = out_dim)
+model = enetv2(enet_type, out_dim=out_dim)
+# model.load_state_dict(torch.load("/home/zhaoxun/codes/Panda/_models/Jun.10_19:58.cls.model"))
 model = model.to(device)
 
-criterion = nn.BCEWithLogitsLoss()
-# criterion = MyBCELoss()
-optimizer = optim.Adam(model.parameters(), lr = init_lr / warmup_factor)
-scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs - warmup_epo)
-scheduler = GradualWarmupScheduler(optimizer, multiplier = warmup_factor, total_epoch = warmup_epo, after_scheduler = scheduler_cosine)
+# criterion = nn.BCEWithLogitsLoss()
+criterion = MSECross()
+# optimizer = optim.Adam(model.parameters(), lr=init_lr/warmup_factor)
+# scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs-warmup_epo)
+# scheduler = GradualWarmupScheduler(optimizer, multiplier=warmup_factor, total_epoch=warmup_epo, after_scheduler=scheduler_cosine)
 
-# optimizer = Radam.Over9000(model.parameters(), lr = init_lr)
-# scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs)
+optimizer = Radam.Over9000(model.parameters(), lr = init_lr)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs)
 
 model, optimizer = amp.initialize(model, optimizer, opt_level = "O1")
 model = torch.nn.DataParallel(model, device_ids = list(range(len(gpus.split(",")))))
@@ -323,10 +304,10 @@ model = torch.nn.DataParallel(model, device_ids = list(range(len(gpus.split(",")
 qwk_max = 0.
 for epoch in range(1, n_epochs + 1):
     printOut(time.ctime(), 'Epoch:', epoch)
-    scheduler.step()
+    scheduler.step(epoch-1)
 
-    train_loss = train_epoch(train_loader, optimizer, epoch != n_epochs)
-    val_loss, acc, qwk = val_epoch(valid_loader, epoch == n_epochs)
+    train_loss = train_epoch(train_loader, optimizer)
+    val_loss, acc, qwk = val_epoch(valid_loader)
 
     content = time.ctime() + ' ' + f'Epoch {epoch}, lr: {optimizer.param_groups[0]["lr"]:.7f}, train loss: {np.mean(train_loss):.5f}, val loss: {np.mean(val_loss):.5f}, acc: {(acc):.5f}, qwk: {(qwk):.5f}'
     printOut(content)

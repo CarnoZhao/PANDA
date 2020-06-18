@@ -7,7 +7,7 @@ image_size = 256
 n_tiles = 36
 batch_size = 16
 num_workers = 4
-out_dim = 5
+out_dim = 6
 init_lr = 6e-4
 warmup_factor = 10
 warmup_epo = 2
@@ -15,7 +15,6 @@ seed = 0
 n_epochs = 1 if DEBUG else 30 + warmup_epo
 weight = 1.2
 isgem = True
-alpha = 0.4
 
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = gpus
@@ -103,6 +102,22 @@ class MyBCELoss(torch.nn.Module):
     def forward(self, input, target, weight):
         return F.binary_cross_entropy_with_logits(input, target, weight.unsqueeze(1), pos_weight = None, reduction = 'mean')
 
+class LabelSmoothingLoss(nn.Module):
+    def __init__(self, classes, smoothing = 0.0, dim = -1):
+        super(LabelSmoothingLoss, self).__init__()
+        self.confidence = 1.0 - smoothing
+        self.smoothing = smoothing
+        self.cls = classes
+        self.dim = dim
+
+    def forward(self, pred, target):
+        pred = pred.log_softmax(dim=self.dim)
+        with torch.no_grad():
+            true_dist = torch.zeros_like(pred)
+            true_dist.fill_(self.smoothing / (self.cls - 1))
+            true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
+        return torch.mean(torch.sum(-true_dist * pred, dim = self.dim))
+
 class GeM(nn.Module):
     def __init__(self, p=3, eps=1e-6):
         super(GeM,self).__init__()
@@ -181,26 +196,10 @@ class PANDADataset(Dataset):
         images /= 255
         images = images.transpose(2, 0, 1)
 
-        label = np.zeros(5).astype(np.float32)
-        label[:row.isup_grade] = 1.
-        return torch.tensor(images), torch.tensor(label), 1 if row.data_provider == "karolinska" else weight
+        # label = np.zeros(5).astype(np.float32)
+        # label[:row.isup_grade] = 1.
+        return torch.tensor(images), row.isup_grade, 1 if row.data_provider == "karolinska" else weight
 
-def mixup_data(x, y, alpha=1, use_cuda=True):
-    '''Returns mixed inputs, pairs of targets, and lambda'''
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1
-
-    batch_size = x.size()[0]
-    index = torch.randperm(batch_size).to(device)
-
-    mixed_x = lam * x + (1 - lam) * x[index, :]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
-
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 transforms_train = albumentations.Compose([
     albumentations.Transpose(p = 0.5),
@@ -211,30 +210,19 @@ transforms_train = albumentations.Compose([
 ])
 transforms_val = albumentations.Compose([])
 
-def train_epoch(loader, optimizer, mix = True):
+def train_epoch(loader, optimizer):
     model.train()
     train_loss = []
     # bar = tqdm(loader, mininterval = 60)
     for (data, target, data_provider) in loader:
         data, target, data_provider = data.to(device), target.to(device), data_provider.to(device)
+        loss_func = criterion
         optimizer.zero_grad()
-
-        # mixup
-        if mix == True:
-            mixdata, target_a, target_b, lam = mixup_data(data, target, alpha = alpha)
-            logits = model(mixdata)
-
-            # loss = loss_func(logits, target)
-            loss = mixup_criterion(criterion, logits, target_a, target_b, lam)
-        else:
-            optimizer.zero_grad()
-            logits = model(data)
-            loss = criterion(logits, target)
-        
+        logits = model(data)
+        loss = loss_func(logits, target)
         # loss.backward()
         with amp.scale_loss(loss, optimizer) as scaled_loss:
             scaled_loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         loss_np = loss.detach().cpu().numpy()
@@ -265,11 +253,11 @@ def val_epoch(loader, tta = False):
             else:
                 logits = model(data)
             loss = criterion(logits, target)
-            pred = logits.sigmoid().sum(1).detach().round()
+            pred = logits.argmax(1).detach()
             LOGITS.append(logits)
             PREDS.append(pred)
-            TARGETS.append(target.sum(1))
-            acc += (target.sum(1) == pred).sum().cpu().numpy()
+            TARGETS.append(target)
+            acc += (target == pred).sum().cpu().numpy()
             val_loss.append(loss.detach().cpu().numpy())
         val_loss = np.mean(val_loss)
         acc = acc / len(dataset_valid) * 100
@@ -307,7 +295,8 @@ valid_loader = torch.utils.data.DataLoader(dataset_valid, batch_size = batch_siz
 model = enetv2(enet_type, out_dim = out_dim)
 model = model.to(device)
 
-criterion = nn.BCEWithLogitsLoss()
+criterion = LabelSmoothingLoss(out_dim, smoothing = 0.1)
+# criterion = nn.CrossEntropyLoss()
 # criterion = MyBCELoss()
 optimizer = optim.Adam(model.parameters(), lr = init_lr / warmup_factor)
 scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs - warmup_epo)
@@ -323,9 +312,9 @@ model = torch.nn.DataParallel(model, device_ids = list(range(len(gpus.split(",")
 qwk_max = 0.
 for epoch in range(1, n_epochs + 1):
     printOut(time.ctime(), 'Epoch:', epoch)
-    scheduler.step()
+    scheduler.step(epoch - 1)
 
-    train_loss = train_epoch(train_loader, optimizer, epoch != n_epochs)
+    train_loss = train_epoch(train_loader, optimizer)
     val_loss, acc, qwk = val_epoch(valid_loader, epoch == n_epochs)
 
     content = time.ctime() + ' ' + f'Epoch {epoch}, lr: {optimizer.param_groups[0]["lr"]:.7f}, train loss: {np.mean(train_loss):.5f}, val loss: {np.mean(val_loss):.5f}, acc: {(acc):.5f}, qwk: {(qwk):.5f}'
