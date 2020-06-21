@@ -1,21 +1,21 @@
 DEBUG = False
-gpus = "0,1"
+gpus = "1"
 enet_type = 'efficientnet-b0'
-fold = 0
+fold = 1
 tile_size = 256
 image_size = 256
 n_tiles = 36
-batch_size = 16
+batch_size = 8
 num_workers = 4
 out_dim = 5
-init_lr = 6e-4
+init_lr = 4e-4
 warmup_factor = 10
 warmup_epo = 2
 seed = 0
 n_epochs = 1 if DEBUG else 30 + warmup_epo
-weight = 1.2
 isgem = True
-alpha = 0.4
+alpha = 0.8
+israndom = True
 
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = gpus
@@ -46,8 +46,9 @@ from sklearn.metrics import cohen_kappa_score, confusion_matrix
 # from tqdm import tqdm_notebook as tqdm
 from tqdm import tqdm
 from apex import amp
-import radam
 import Radam
+import ranger
+from PoolTileNet import Mish
 
 def make_file_path():
     basepath = os.path.split(os.path.realpath(__file__))[0]
@@ -96,13 +97,6 @@ pretrained_model = {
 def gem(x, p=3, eps=1e-6):
     return torch.nn.functional.avg_pool2d(x.clamp(min = eps).pow(p), (x.size(-2), x.size(-1))).pow(1./p)
 
-class MyBCELoss(torch.nn.Module):
-    def __init__(self):
-        super(MyBCELoss, self).__init__()
-
-    def forward(self, input, target, weight):
-        return F.binary_cross_entropy_with_logits(input, target, weight.unsqueeze(1), pos_weight = None, reduction = 'mean')
-
 class GeM(nn.Module):
     def __init__(self, p=3, eps=1e-6):
         super(GeM,self).__init__()
@@ -122,7 +116,16 @@ class enetv2(nn.Module):
         state_dict = torch.load(pretrained_model[backbone])
         self.enet.load_state_dict(state_dict)
         self.myfc = nn.Linear(self.enet._fc.in_features * (1 if isgem else 2), out_dim)
-        self.enet._avg_pooling = GeM() if isgem else AdaptiveConcatPool2d() 
+        self.enet._avg_pooling = GeM() if isgem else AdaptiveConcatPool2d()
+        # self.enet._dropout = nn.Identity()
+        # self.myfc = nn.Sequential(
+        #     Flatten(),
+        #     nn.Linear(self.enet._fc.in_features * (1 if isgem else 2), 512),
+        #     Mish(),
+        #     nn.BatchNorm1d(512), 
+        #     nn.Dropout(0.5),
+        #     nn.Linear(512, out_dim)
+        # )
         # self.enet._dropout = torch.nn.Dropout(0.4, inplace = False)
         self.enet._fc = nn.Identity()
 
@@ -156,8 +159,6 @@ class PANDADataset(Dataset):
         idxes = list(range(self.n_tiles))
         if self.rand:
             idxes = np.random.choice(idxes, len(idxes), replace = False)
-            # for i in range(n_row_tiles):
-            #     idxes[i * n_row_tiles: (i + 1) * n_row_tiles] = np.random.choice(idxes[i * n_row_tiles: (i + 1) * n_row_tiles], n_row_tiles, replace = False)
 
         images = np.zeros((image_size * n_row_tiles, image_size * n_row_tiles, 3), dtype = np.uint8)
         for h in range(n_row_tiles):
@@ -175,15 +176,15 @@ class PANDADataset(Dataset):
                 w1 = w * image_size
                 images[h1:h1+image_size, w1:w1 + image_size] = this_img
 
-        if self.transform is not None:
-            images = self.transform(image = images)['image']
+        # if self.transform is not None:
+        #     images = self.transform[1](image = images)['image']
         images = images.astype(np.float32)
         images /= 255
         images = images.transpose(2, 0, 1)
 
         label = np.zeros(5).astype(np.float32)
         label[:row.isup_grade] = 1.
-        return torch.tensor(images), torch.tensor(label), 1 if row.data_provider == "karolinska" else weight
+        return torch.tensor(images), torch.tensor(label)
 
 def mixup_data(x, y, alpha=1, use_cuda=True):
     '''Returns mixed inputs, pairs of targets, and lambda'''
@@ -203,20 +204,21 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 transforms_train = albumentations.Compose([
-    albumentations.Transpose(p = 0.5),
-    albumentations.VerticalFlip(p = 0.5),
-    albumentations.HorizontalFlip(p = 0.5),
-    albumentations.RandomBrightnessContrast(p = 0.5),
-    albumentations.Rotate(20, border_mode = cv2.BORDER_CONSTANT, value = 0)
-])
+        albumentations.Transpose(p = 0.5),
+        albumentations.VerticalFlip(p = 0.5),
+        albumentations.HorizontalFlip(p = 0.5),
+        albumentations.RandomBrightnessContrast(p = 0.5),
+        # albumentations.GaussNoise(p = 0.5),
+        albumentations.Rotate(20, border_mode = cv2.BORDER_CONSTANT, value = 0)
+    ])
 transforms_val = albumentations.Compose([])
 
 def train_epoch(loader, optimizer, mix = True):
     model.train()
     train_loss = []
     # bar = tqdm(loader, mininterval = 60)
-    for (data, target, data_provider) in loader:
-        data, target, data_provider = data.to(device), target.to(device), data_provider.to(device)
+    for (data, target) in loader:
+        data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
 
         # mixup
@@ -234,8 +236,9 @@ def train_epoch(loader, optimizer, mix = True):
         # loss.backward()
         with amp.scale_loss(loss, optimizer) as scaled_loss:
             scaled_loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        scheduler.step()
 
         loss_np = loss.detach().cpu().numpy()
         train_loss.append(loss_np)
@@ -252,8 +255,8 @@ def val_epoch(loader, tta = False):
     TARGETS = []
     acc = 0.
     with torch.no_grad():
-        for (data, target, data_provider) in loader:
-            data, target, data_provider = data.to(device), target.to(device), data_provider.to(device)
+        for (data, target) in loader:
+            data, target = data.to(device), target.to(device)
             if tta:
                 logits = torch.stack([model(datai) for datai in [
                         data,
@@ -298,7 +301,7 @@ valid_idx = np.where((df_train['fold'] == fold))[0]
 df_this  = df_train.loc[train_idx]
 df_valid = df_train.loc[valid_idx]
 
-dataset_train = PANDADataset(df_this , image_size, n_tiles, rand = True, transform = transforms_train)
+dataset_train = PANDADataset(df_this , image_size, n_tiles, rand = israndom, transform = transforms_train)
 dataset_valid = PANDADataset(df_valid, image_size, n_tiles, transform = transforms_val)
 
 train_loader = torch.utils.data.DataLoader(dataset_train, batch_size = batch_size, sampler = RandomSampler(dataset_train), num_workers = num_workers)
@@ -309,23 +312,24 @@ model = model.to(device)
 
 criterion = nn.BCEWithLogitsLoss()
 # criterion = MyBCELoss()
-optimizer = optim.Adam(model.parameters(), lr = init_lr / warmup_factor)
-scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs - warmup_epo)
-scheduler = GradualWarmupScheduler(optimizer, multiplier = warmup_factor, total_epoch = warmup_epo, after_scheduler = scheduler_cosine)
+# optimizer = optim.Adam(model.parameters(), lr = init_lr / warmup_factor)
+# scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs - warmup_epo)
+# scheduler = GradualWarmupScheduler(optimizer, multiplier = warmup_factor, total_epoch = warmup_epo, after_scheduler = scheduler_cosine)
 
-# optimizer = Radam.Over9000(model.parameters(), lr = init_lr)
-# scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs)
+optimizer = optim.Adam(model.parameters(), lr = init_lr / warmup_factor)
+scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, init_lr, pct_start = 0.3, div_factor = 25, epochs = n_epochs, steps_per_epoch = len(train_loader))
 
 model, optimizer = amp.initialize(model, optimizer, opt_level = "O1")
+# model.load_state_dict(torch.load("/home/zhaoxun/codes/Panda/_models/Jun.17_09:15.cls.final.model"))
 model = torch.nn.DataParallel(model, device_ids = list(range(len(gpus.split(",")))))
 
 
 qwk_max = 0.
 for epoch in range(1, n_epochs + 1):
     printOut(time.ctime(), 'Epoch:', epoch)
-    scheduler.step()
+    # scheduler.step(epoch - 1)
 
-    train_loss = train_epoch(train_loader, optimizer, epoch != n_epochs)
+    train_loss = train_epoch(train_loader, optimizer, True)
     val_loss, acc, qwk = val_epoch(valid_loader, epoch == n_epochs)
 
     content = time.ctime() + ' ' + f'Epoch {epoch}, lr: {optimizer.param_groups[0]["lr"]:.7f}, train loss: {np.mean(train_loss):.5f}, val loss: {np.mean(val_loss):.5f}, acc: {(acc):.5f}, qwk: {(qwk):.5f}'

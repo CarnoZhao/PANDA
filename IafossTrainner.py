@@ -6,6 +6,7 @@ import random
 import argparse
 import traceback
 import warnings
+import fastai
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, cohen_kappa_score
@@ -261,7 +262,7 @@ class Train(object):
 
     def train(self):
         dl = get_data(self.kwargs['bs'])
-        ln = Learner(
+        ln = fastai.Learner(
             dl, self.net, 
             loss_func = self.loss, 
             opt_func = self.opt, 
